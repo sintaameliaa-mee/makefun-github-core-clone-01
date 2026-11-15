@@ -14,7 +14,7 @@ import {
   type PullRequest,
   type Repo,
 } from './store.ts';
-import { errorResult, jsonResult, type HandlerResult } from './httputil.ts';
+import { errorResult, jsonRawResult, jsonResult, type HandlerResult } from './httputil.ts';
 
 export interface RestContext {
   forge: Forge;
@@ -83,6 +83,29 @@ export function repoJson(repo: Repo): JsonRecord {
 function labelJson(repo: Repo, name: string): JsonRecord {
   const label = repo.labels.get(name);
   return { name, color: label?.color ?? 'ededed' };
+}
+
+/** Clear one issue's cached REST JSON (call after any mutation of the issue). */
+export function invalidateIssueJson(issue: Issue): void {
+  issue.cachedJson = null;
+}
+
+/** Clear every issue's cached REST JSON in a repository (a label change recolours them all). */
+function invalidateRepoIssueJson(repo: Repo): void {
+  for (const issue of repo.issues.values()) issue.cachedJson = null;
+}
+
+/**
+ * The single-issue REST JSON body (with its trailing newline), cached on the issue:
+ * a repeated GET of the same issue — the read workload's 2,000 — skips the rebuild
+ * and the stringify. Byte-identical to `jsonResult(200, issueJson(repo, issue))`.
+ */
+function issueJsonString(repo: Repo, issue: Issue): string {
+  const cached = issue.cachedJson;
+  if (cached !== null) return cached;
+  const body = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issue.cachedJson = body;
+  return body;
 }
 
 export function issueJson(repo: Repo, issue: Issue): JsonRecord {
@@ -445,6 +468,7 @@ function handleRepo(ctx: RestContext, repo: Repo, rest: string[]): HandlerResult
       if (!name) return errorResult(422, 'name is required');
       const color = stringField(ctx.json, 'color') ?? 'ededed';
       repo.labels.set(name, { name, color });
+      invalidateRepoIssueJson(repo);
       return jsonResult(201, { name, color });
     }
     return errorResult(404, 'Not Found');
@@ -485,7 +509,7 @@ function handleRepo(ctx: RestContext, repo: Repo, rest: string[]): HandlerResult
     const issue = number === null ? undefined : repo.issues.get(number);
     if (!issue) return errorResult(404, 'Not Found');
     if (rest.length === 2) {
-      if (method === 'GET') return jsonResult(200, issueJson(repo, issue));
+      if (method === 'GET') return jsonRawResult(200, issueJsonString(repo, issue));
       if (method === 'PATCH') {
         const state = stringField(ctx.json, 'state');
         if (state === 'open' || state === 'closed') issue.state = state;
@@ -493,6 +517,7 @@ function handleRepo(ctx: RestContext, repo: Repo, rest: string[]): HandlerResult
         if (title !== undefined) issue.title = title;
         const body = stringField(ctx.json, 'body');
         if (body !== undefined) issue.body = body;
+        invalidateIssueJson(issue);
         return jsonResult(200, issueJson(repo, issue));
       }
       return errorResult(404, 'Not Found');
@@ -505,6 +530,7 @@ function handleRepo(ctx: RestContext, repo: Repo, rest: string[]): HandlerResult
         const body = stringField(ctx.json, 'body') ?? '';
         const comment = { id: forge.allocateCommentId(), body, createdAt: isoOf(nextTimestamp()) };
         issue.comments.push(comment);
+        invalidateIssueJson(issue);
         return jsonResult(201, commentJson(comment));
       }
     }

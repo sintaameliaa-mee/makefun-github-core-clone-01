@@ -33,6 +33,37 @@ const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 /** The largest data chunk inside one sideband packet (well under the pkt-line limit). */
 const SIDEBAND_CHUNK = 32768;
 
+/**
+ * Cached fetch responses, per repository: an identical fetch against an unchanged
+ * store returns the same bytes, so the clone workload's 50 concurrent depth-1
+ * clones of one repository build the pack once. The key covers everything the
+ * response depends on — the protocol, the fetch arguments, and the object count
+ * (objects are only ever added, never removed or modified, so an unchanged count
+ * with the same arguments means an unchanged answer). Refs never enter a fetch
+ * response. Each repository's cache is capped and cleared past it.
+ */
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX_ENTRIES = 32;
+
+function fetchCacheKey(protocol: 'v2' | 'v0', args: FetchArgs, objectCount: number): string {
+  return `${protocol}|${objectCount}|${args.wants.join(',')}|${args.haves.join(',')}|${args.depth ?? ''}|${args.shallow.join(',')}`;
+}
+
+function cachedFetch(repo: Repo, protocol: 'v2' | 'v0', args: FetchArgs, build: () => Buffer): Buffer {
+  let perRepo = fetchCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map();
+    fetchCache.set(repo, perRepo);
+  }
+  const key = fetchCacheKey(protocol, args, repo.objects.size);
+  const hit = perRepo.get(key);
+  if (hit) return hit;
+  const built = build();
+  if (perRepo.size >= FETCH_CACHE_MAX_ENTRIES) perRepo.clear();
+  perRepo.set(key, built);
+  return built;
+}
+
 /** Wrap bytes in sideband packets (band 1) for a pack or a push report. */
 function sidebandPackets(data: Buffer, band = 1): Buffer[] {
   const packets: Buffer[] = [];
@@ -109,6 +140,9 @@ function v2Advertisement(): Buffer {
   ]);
 }
 
+/** The v2 advertisement never varies: build it once, serve the same bytes. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
 /** GET /{owner}/{repo}.git/info/refs?service=<service> */
 export function gitInfoRefs(
   forge: Forge,
@@ -121,7 +155,7 @@ export function gitInfoRefs(
   if (!repo) return errorResult(404, 'Not Found');
   if (service === 'git-upload-pack') {
     if (gitProtocol === 'version=2') {
-      return { status: 200, contentType: UPLOAD_ADVERTISEMENT, body: v2Advertisement() };
+      return { status: 200, contentType: UPLOAD_ADVERTISEMENT, body: V2_ADVERTISEMENT };
     }
     return { status: 200, contentType: UPLOAD_ADVERTISEMENT, body: v0Advertisement(repo, 'git-upload-pack') };
   }
@@ -277,13 +311,13 @@ export function gitUploadPack(
         return { status: 200, contentType: UPLOAD_RESULT, body: handleLsRefs(repo, args.lsRefs) };
       }
       if (command === 'command=fetch') {
-        return { status: 200, contentType: UPLOAD_RESULT, body: handleFetchV2(repo, args.fetch) };
+        return { status: 200, contentType: UPLOAD_RESULT, body: cachedFetch(repo, 'v2', args.fetch, () => handleFetchV2(repo, args.fetch)) };
       }
       return errorResult(400, `unknown v2 command ${JSON.stringify(command)}`);
     }
     // v0: wants (with shallow/deepen) in the first section, haves + done in the second.
     const args = parseV0FetchArgs(packets);
-    return { status: 200, contentType: UPLOAD_RESULT, body: handleFetchV0(repo, args) };
+    return { status: 200, contentType: UPLOAD_RESULT, body: cachedFetch(repo, 'v0', args, () => handleFetchV0(repo, args)) };
   } catch (err) {
     if (err instanceof PktLineError || err instanceof PackError) return errorResult(400, err.message);
     throw err;

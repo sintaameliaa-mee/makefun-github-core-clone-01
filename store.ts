@@ -83,6 +83,13 @@ export interface Issue {
   createdAt: string;
   updatedAt: string;
   seq: number;
+  /**
+   * The REST single-issue JSON body (with its trailing newline), cached by rest.ts
+   * so a repeated GET of the same issue skips the rebuild; null when stale. Every
+   * mutation of the issue — or of the repository's labels, whose colours the JSON
+   * carries — clears it (see rest.ts and graphql.ts).
+   */
+  cachedJson: string | null;
 }
 
 export interface PullRequest {
@@ -350,9 +357,27 @@ export class Repo {
     return seen;
   }
 
+  /**
+   * Whether `maybeAncestor` is `tip` itself or one of its ancestors. Walks from the
+   * tip toward its parents and stops as soon as the target is found: a push's old
+   * tip is usually the new tip's direct parent, so that case is O(1) instead of a
+   * walk over the whole history. (The old code built the full ancestor set first.)
+   */
   isAncestor(maybeAncestor: string, tip: string | undefined): boolean {
     if (maybeAncestor === tip) return true;
-    return this.ancestorSet(tip).has(maybeAncestor);
+    if (!tip) return false;
+    const seen = new Set<string>();
+    const stack: string[] = [tip];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (oid === maybeAncestor) return true;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const commit = this.getCommit(oid);
+      if (!commit) continue;
+      for (const parent of commit.parents) stack.push(parent);
+    }
+    return false;
   }
 
   /**
@@ -580,6 +605,7 @@ export class Repo {
       createdAt: now,
       updatedAt: now,
       seq: this.nextNumber,
+      cachedJson: null,
     };
     this.nextNumber += 1;
     this.issues.set(issue.number, issue);

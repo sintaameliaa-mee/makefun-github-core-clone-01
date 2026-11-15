@@ -24,13 +24,28 @@ import { errorResult, jsonResult, newRequestId, type HandlerResult } from './htt
 /** The largest request body accepted (packs from the suite stay far below this). */
 const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
+/** A shared empty query set for requests that carry no query string (never mutated). */
+const EMPTY_QUERY = new URLSearchParams();
+
 /** The path and query of a request URL, or '/' when it does not parse. */
 function urlOf(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
+  // Fast path: most requests carry a plain path with no query string, no escapes
+  // and no dot segments — take it as-is instead of building a URL object.
+  if (
+    raw.startsWith('/') &&
+    !raw.startsWith('//') &&
+    !raw.includes('?') &&
+    !raw.includes('%') &&
+    !raw.includes('/.')
+  ) {
+    return { path: raw, query: EMPTY_QUERY };
+  }
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
     return { path: url.pathname, query: url.searchParams };
   } catch {
-    return { path: '/', query: new URLSearchParams() };
+    return { path: '/', query: EMPTY_QUERY };
   }
 }
 
@@ -60,14 +75,15 @@ function authorized(req: IncomingMessage, expectedToken: string): boolean {
 
 /** Write a handler's result to the socket, with X-GitHub-Request-Id on every reply. */
 function sendResult(res: ServerResponse, result: HandlerResult): void {
-  const body = typeof result.body === 'string' ? Buffer.from(result.body, 'utf8') : result.body;
+  const isString = typeof result.body === 'string';
+  const length = isString ? Buffer.byteLength(result.body, 'utf8') : result.body.length;
   res.writeHead(result.status, {
     'content-type': result.contentType,
-    'content-length': body.length,
+    'content-length': length,
     'x-github-request-id': newRequestId(),
     ...(result.headers ?? {}),
   });
-  res.end(body);
+  res.end(result.body);
 }
 
 const GIT_ROUTE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
@@ -95,7 +111,11 @@ async function handleRequest(forge: Forge, expectedToken: string, req: IncomingM
     return;
   }
 
-  const body = await readBody(req);
+  // GET and HEAD requests carry no body in this suite: when the request frames
+  // none (no content-length, no chunked encoding), skip the body read entirely
+  // instead of waiting a tick for the stream's end event.
+  const hasBodyFrame = req.headers['content-length'] !== undefined || req.headers['transfer-encoding'] !== undefined;
+  const body = (method === 'GET' || method === 'HEAD') && !hasBodyFrame ? Buffer.alloc(0) : await readBody(req);
 
   // Git smart HTTP: /{owner}/{repo}.git/{info/refs,git-upload-pack,git-receive-pack}.
   const gitMatch = GIT_ROUTE.exec(path);
@@ -152,7 +172,7 @@ async function handleRequest(forge: Forge, expectedToken: string, req: IncomingM
   // REST v3: /api/v3/...
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
     const restPath = path === '/api/v3' ? '' : path.slice('/api/v3/'.length);
-    const segments = restPath === '' ? [] : restPath.split('/').map((segment) => decodeURIComponent(segment));
+    const segments = restPath === '' ? [] : restPath.split('/').map((segment) => (segment.includes('%') ? decodeURIComponent(segment) : segment));
     let json: unknown;
     let jsonError = false;
     if (body.length > 0) {

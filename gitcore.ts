@@ -325,10 +325,34 @@ function readOfsDeltaBase(buffer: Buffer, offset: number): { baseOffset: number;
 }
 
 /**
+ * Adler-32 of `data` (zlib's checksum: the last 4 bytes of a zlib stream), with
+ * the modulo deferred in 5552-byte blocks, the largest that cannot overflow.
+ */
+function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(data.length, i + 5552);
+    for (; i < end; i += 1) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
  * Inflate one zlib stream starting at `offset` in `buffer`; returns the data and the
  * offset just past the stream's end. Node's inflateSync ignores trailing bytes and
- * throws on a truncated stream, so "inflates cleanly" is monotone in the window length
- * and a binary search finds the exact end. (Verified against Node 24's zlib.)
+ * throws on a truncated stream, so the stream's end is found from its own checksum:
+ * the last 4 bytes of a zlib stream are the Adler-32 of its output, so the first
+ * position where those bytes occur AND the prefix inflates cleanly to the same
+ * output is the true end (a match inside the deflate data fails the inflate, since
+ * the stream is truncated there). Two inflates per object instead of a binary
+ * search's dozen, and no thrown errors on the happy path.
  */
 function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number } {
   const rest = buffer.subarray(offset);
@@ -339,6 +363,23 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number
   } catch {
     throw new PackError('could not inflate a pack object');
   }
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(full), 0);
+  let at = rest.indexOf(needle, 2);
+  while (at !== -1) {
+    const end = at + 4;
+    try {
+      const data = inflateSync(rest.subarray(0, end));
+      if (data.length === full.length && data.equals(full)) {
+        return { data: full, next: offset + end };
+      }
+    } catch {
+      // A checksum match inside the deflate data: not the stream's end.
+    }
+    at = rest.indexOf(needle, at + 1);
+  }
+  // No checksum match (not expected for a well-formed stream): fall back to a
+  // binary search over the window length, which always finds the end.
   let lo = 1;
   let hi = rest.length;
   while (lo < hi) {
@@ -350,7 +391,6 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number
       lo = mid + 1;
     }
   }
-  void full;
   return { data: inflateSync(rest.subarray(0, lo)), next: offset + lo };
 }
 

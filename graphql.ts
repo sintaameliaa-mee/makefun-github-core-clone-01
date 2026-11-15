@@ -798,6 +798,7 @@ function resolveMutationField(_parent: AnyRecord, field: string, args: AnyRecord
       const found = issueFromGlobalId(ctx, String(input.issueId ?? ''));
       if (!found) throw new FieldFailure('closeIssue: the issue id does not name an issue');
       found.issue.state = 'closed';
+      found.issue.cachedJson = null;
       return { __typename: 'CloseIssuePayload', issue: issueValue(found.repo, found.issue) };
     }
     case 'createPullRequest': {
@@ -835,6 +836,7 @@ function resolveMutationField(_parent: AnyRecord, field: string, args: AnyRecord
         createdAt: isoOf(nextTimestamp()),
       };
       found.issue.comments.push(comment);
+      found.issue.cachedJson = null;
       return {
         __typename: 'AddCommentPayload',
         commentEdge: {
